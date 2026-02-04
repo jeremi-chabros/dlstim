@@ -8,6 +8,7 @@
 #     "h5py>=3.9",
 #     "tqdm>=4.65",
 #     "scikit-learn>=1.3",
+#     "scipy>=1.10",
 # ]
 # ///
 """
@@ -29,10 +30,79 @@ from dataclasses import dataclass, field
 from typing import Optional
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+import scipy.ndimage
 
 # =============================================================================
 # 1. Configuration
 # =============================================================================
+
+def post_process_mask(pred_mask: np.ndarray, 
+                      sampling_rate: int = 250, 
+                      min_gap_ms: float = 100.0, 
+                      min_duration_ms: float = 100.0):
+    """
+    1. Merges detections closer than `min_gap_ms` (Refractory Period logic).
+    2. Removes detections shorter than `min_duration_ms`.
+    """
+    # Convert ms to samples
+    gap_samples = int(min_gap_ms / 1000 * sampling_rate)
+    min_samples = int(min_duration_ms / 1000 * sampling_rate)
+    
+    # 1. Morphological Closing (Gap Filling)
+    # This connects the "onset" and "offset" if they are within `gap_samples`
+    struct = np.ones(gap_samples)
+    closed_mask = scipy.ndimage.binary_closing(pred_mask, structure=struct).astype(int)
+    
+    # 2. Filter by Minimum Duration (Remove noise)
+    # Label connected components
+    labeled_array, num_features = scipy.ndimage.label(closed_mask)
+    
+    final_mask = np.zeros_like(closed_mask)
+    for i in range(1, num_features + 1):
+        component = (labeled_array == i)
+        if np.sum(component) >= min_samples:
+            final_mask[component] = 1
+            
+    return final_mask
+
+def compute_event_metrics(pred_mask, true_mask, tolerance_sec=0.1, fs=250):
+    """
+    Computes Precision/Recall/F1 based on EVENTS, not samples.
+    An event is a "Hit" if the predicted onset is within `tolerance_sec` 
+    of the true onset.
+    """
+    tol_samples = int(tolerance_sec * fs)
+    
+    # Get onset indices (where mask goes from 0 to 1)
+    pred_onsets = np.where(np.diff(pred_mask, prepend=0) == 1)[0]
+    true_onsets = np.where(np.diff(true_mask, prepend=0) == 1)[0]
+    
+    tp = 0
+    matched_truth_indices = set()
+    
+    for p_onset in pred_onsets:
+        # Find closest true onset
+        if len(true_onsets) == 0:
+            break
+        
+        # Calculate distances to all true onsets
+        dists = np.abs(true_onsets - p_onset)
+        min_dist_idx = np.argmin(dists)
+        min_dist = dists[min_dist_idx]
+        
+        # If within tolerance and that truth hasn't been used yet
+        if min_dist <= tol_samples and min_dist_idx not in matched_truth_indices:
+            tp += 1
+            matched_truth_indices.add(min_dist_idx)
+            
+    fn = len(true_onsets) - len(matched_truth_indices)
+    fp = len(pred_onsets) - tp
+    
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    
+    return precision, recall, f1
 
 @dataclass
 class Config:
@@ -45,7 +115,9 @@ class Config:
     # Signal parameters
     sampling_rate: int = 250
     n_channels: int = 4
-    window_samples: int = 512  # ~2 seconds at 250 Hz
+    # window_samples: int = 512  # ~2 seconds at 250 Hz
+    # stride_samples: int = 128  # ~0.5 second stride for training
+    window_samples: int = 2048  # ~2 seconds at 250 Hz
     stride_samples: int = 128  # ~0.5 second stride for training
     
     # Stimulation parameter columns (must match CSV)
@@ -61,9 +133,10 @@ class Config:
     # Model architecture
     base_channels: int = 32
     channel_mult: tuple = (1, 2, 4, 8)  # 32, 64, 128, 256
-    bottleneck_channels: int = 512
+    # bottleneck_channels: int = 512
+    bottleneck_channels: int = 2*max(channel_mult)*base_channels  # 512
     film_hidden_dim: int = 128
-    dropout: float = 0.3
+    dropout: float = 0.01
     
     # Training — optimized for M4 Pro 48GB
     batch_size: int = 128          # Larger batch for GPU utilization
@@ -427,9 +500,10 @@ class StimArtifactDataset(Dataset):
             # Extract stim parameters
             stim_params = self._extract_stim_params(row)
             
+            eff_stim_duration = max(row.get('stim_duration_ms', cfg.artifact_duration_ms), 100.0)
             # Generate windows
             artifact_duration_samples = int(
-                row.get('stim_duration_ms', cfg.artifact_duration_ms) / 1000 * cfg.sampling_rate
+                eff_stim_duration / 1000 * cfg.sampling_rate
             )
             
             for start in range(0, n_samples - cfg.window_samples, cfg.stride_samples):
@@ -639,8 +713,7 @@ class Trainer:
             self.optimizer, 
             mode='max',      # We want to MAXIMIZE F1
             factor=0.5,      # Cut LR by half when stuck
-            patience=3,      # Wait 3 epochs before cutting LR
-            verbose=True
+            patience=3      # Wait 3 epochs before cutting LR
         )
         
         self.criterion = CombinedLoss(cfg)
@@ -697,6 +770,7 @@ class Trainer:
         total_loss = 0.0
         all_preds, all_targets = [], []
         
+        # 1. Collect raw predictions
         for batch in tqdm(loader, desc="Validating"):
             signal = batch['signal'].to(self.device)
             mask = batch['mask'].to(self.device)
@@ -709,8 +783,37 @@ class Trainer:
             all_preds.append(pred.cpu())
             all_targets.append(mask.cpu())
         
-        metrics = compute_metrics(torch.cat(all_preds), torch.cat(all_targets))
-        metrics['loss'] = total_loss / len(loader)
+        # Concatenate
+        flat_preds = torch.cat(all_preds).numpy().squeeze()  # (N, L)
+        flat_targets = torch.cat(all_targets).numpy().squeeze()
+        
+        # 2. Compute Standard (Sample-wise) Metrics
+        # We assume threshold 0.5 for raw sample metrics
+        metrics = compute_metrics(torch.from_numpy(flat_preds), torch.from_numpy(flat_targets))
+        
+        # 3. Compute Event-Based Metrics (The new stuff!)
+        # We need to loop over the batch dimension because post-processing is per-recording
+        event_precisions, event_recalls, event_f1s = [], [], []
+        
+        for i in range(len(flat_preds)):
+            # Apply the morphological post-processing
+            # Note: We binarize at 0.5 first
+            clean_pred = post_process_mask(flat_preds[i] > 0.5, sampling_rate=self.cfg.sampling_rate)
+            
+            # Compute event metrics for this single recording
+            ep, er, ef1 = compute_event_metrics(clean_pred, flat_targets[i], tolerance_sec=0.1)
+            event_precisions.append(ep)
+            event_recalls.append(er)
+            event_f1s.append(ef1)
+            
+        # Add averaged event metrics to the results
+        metrics.update({
+            'loss': total_loss / len(loader),
+            'event_precision': np.mean(event_precisions),
+            'event_recall': np.mean(event_recalls),
+            'event_f1': np.mean(event_f1s)
+        })
+        
         return metrics
     
     def fit(self, train_loader: DataLoader, val_loader: DataLoader):
@@ -735,6 +838,7 @@ class Trainer:
             print(f"Val   - Loss: {val_metrics['loss']:.4f}, F1: {val_metrics['f1']:.4f}, "
                   f"Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}")
             print(f"LR    - {current_lr:.2e}")
+            print(f"      - Event F1: {val_metrics['event_f1']:.4f} (P: {val_metrics['event_precision']:.4f}, R: {val_metrics['event_recall']:.4f})")
 
             # CHANGE 4: Early Stopping Logic
             if val_metrics['f1'] > self.best_f1:
