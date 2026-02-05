@@ -452,7 +452,7 @@ class StimArtifactUNet(nn.Module):
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:    (B, 4, L)  raw ECoG, z-scored per window
+            x:    (B, 4, L)  ECoG robust-scaled with file median & IQR
             cond: (B, 32)    conditioning vector
         Returns:
             (B, 1, L) artifact probability mask
@@ -555,13 +555,29 @@ def parse_onset_vector(onset_str: str) -> np.ndarray:
     return np.array(vals, dtype=np.float64)
 
 
+def _robust_scale_stats(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute median and IQR per channel for robust global scaling.
+
+    data: (n_channels, n_samples) float32
+    Returns: (median, iqr) each (n_channels,) for use as (x - median) / (iqr + eps).
+    """
+    median = np.median(data, axis=1).astype(np.float32)  # (4,)
+    q1 = np.percentile(data, 25, axis=1).astype(np.float32)
+    q3 = np.percentile(data, 75, axis=1).astype(np.float32)
+    iqr = (q3 - q1).astype(np.float32)
+    return median, iqr
+
+
 class StimArtifactDataset(Dataset):
     """Sliding-window dataset for stim artifact detection.
 
     Each sample is a (window_samples,) slice of one recording with:
-        - signal: (4, window_samples) z-scored ECoG
+        - signal: (4, window_samples) robust-scaled ECoG (using file median & IQR)
         - mask:   (1, window_samples) binary artifact mask
         - cond:   (32,) conditioning features
+
+    Normalization uses the entire recording's median and IQR per channel,
+    not the window's statistics (robust global scaling).
     """
 
     def __init__(self, df: pd.DataFrame, file_map: dict[str, Path],
@@ -569,9 +585,10 @@ class StimArtifactDataset(Dataset):
         self.cfg = cfg
         self.augment = augment
         self.data_cache: dict[str, np.ndarray] = {}
+        self.file_stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}  # path -> (median, iqr)
         self.samples: list[dict] = []
 
-        # Pre-load H5 files into RAM
+        # Pre-load H5 files into RAM and compute file-level stats (median, IQR)
         if cfg.preload_to_ram:
             unique_paths = set()
             for _, row in df.iterrows():
@@ -632,6 +649,19 @@ class StimArtifactDataset(Dataset):
 
         print(f"Total samples: {len(self.samples)}")
 
+        # When not preloading, compute file-level stats (median, IQR) for each unique file
+        if not cfg.preload_to_ram:
+            unique_paths = {s['h5_path'] for s in self.samples}
+            for p in tqdm(unique_paths, desc="File stats"):
+                key = str(p)
+                if key not in self.file_stats:
+                    with h5py.File(p, 'r') as f:
+                        data = np.stack([
+                            f[f'channel_{i}'][:].astype(np.float32)
+                            for i in range(1, 5)
+                        ], axis=0)
+                    self.file_stats[key] = _robust_scale_stats(data)
+
     def _cache_file(self, h5_path: Path) -> None:
         with h5py.File(h5_path, 'r') as f:
             data = np.stack([
@@ -639,6 +669,7 @@ class StimArtifactDataset(Dataset):
                 for i in range(1, 5)
             ], axis=0)  # (4, T)
         self.data_cache[str(h5_path)] = data
+        self.file_stats[str(h5_path)] = _robust_scale_stats(data)
 
     def _make_mask(self, onsets: np.ndarray, start: int, end: int,
                    mask_dur: int) -> np.ndarray:
@@ -671,10 +702,9 @@ class StimArtifactDataset(Dataset):
                     for i in range(1, 5)
                 ], axis=0)
 
-        # Z-score per channel per window
-        mu = sig.mean(axis=1, keepdims=True)
-        sd = sig.std(axis=1, keepdims=True) + 1e-8
-        sig = (sig - mu) / sd
+        # Robust global scaling: normalize using file's median and IQR (not window stats)
+        median, iqr = self.file_stats[key]
+        sig = (sig - median[:, np.newaxis]) / (iqr[:, np.newaxis] + 1e-8)
 
         # Mask
         mask = self._make_mask(s['onsets'], s['start'], s['end'], s['mask_dur'])
@@ -965,6 +995,7 @@ class Trainer:
     def predict_file(self, h5_path: Path, cond: np.ndarray) -> np.ndarray:
         """Run inference on a whole file with overlapping windows.
 
+        Uses robust global scaling: file median and IQR to normalize each window.
         Returns full-length probability array.
         """
         self.model.eval()
@@ -974,6 +1005,7 @@ class Trainer:
                 for i in range(1, 5)
             ], axis=0)
 
+        median, iqr = _robust_scale_stats(data)
         rlen = data.shape[1]
         ws = self.cfg.window_samples
         stride = max(1, int(ws * self.cfg.inference_stride_ratio))
@@ -985,9 +1017,7 @@ class Trainer:
         for s in range(0, rlen - ws + 1, stride):
             e = s + ws
             win = data[:, s:e].copy()
-            mu = win.mean(axis=1, keepdims=True)
-            sd = win.std(axis=1, keepdims=True) + 1e-8
-            win = (win - mu) / sd
+            win = (win - median[:, np.newaxis]) / (iqr[:, np.newaxis] + 1e-8)
 
             sig_t = torch.from_numpy(win).unsqueeze(0).to(self.device)
             p = self.model(sig_t, cond_t).cpu().numpy().squeeze()
