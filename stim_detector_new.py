@@ -46,6 +46,12 @@ from typing import Optional
 from tqdm import tqdm
 from sklearn.model_selection import GroupShuffleSplit
 import scipy.ndimage
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    OneCycleLR,
+    SequentialLR,
+)
 
 # =============================================================================
 # 1. Configuration
@@ -83,16 +89,18 @@ class Config:
 
     # ---------- Training ----------
     batch_size: int = 64
-    epochs: int = 150
+    epochs: int = 100
     lr: float = 1e-3
     weight_decay: float = 1e-3
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
     dice_weight: float = 1.0
     focal_weight: float = 0.5
-    patience: int = 15
+    patience: int = 10
     min_lr: float = 1e-6
     preload_to_ram: bool = True
+    # LR scheduler: 'onecycle' (step-based) or 'warmup_cosine' (epoch-based)
+    lr_scheduler: str = "onecycle"
 
     # ---------- Post-processing ----------
     min_artifact_samples: int = 250  # 1 second at 250 Hz
@@ -861,6 +869,124 @@ def compute_event_metrics(pred_mask: np.ndarray, true_mask: np.ndarray,
     return {'event_precision': prec, 'event_recall': rec, 'event_f1': f1}
 
 
+def compute_event_counts(pred_mask: np.ndarray, true_mask: np.ndarray,
+                         min_iou: float = 0.3) -> tuple[int, int, int, int, int]:
+    """Event-level counts: (n_gt, n_pred, tp, fp, fn) using IoU overlap."""
+    from scipy.ndimage import label, find_objects
+
+    pred_lab, n_pred = label(pred_mask)
+    true_lab, n_true = label(true_mask)
+
+    if n_pred == 0 and n_true == 0:
+        return (0, 0, 0, 0, 0)
+    if n_pred == 0:
+        return (n_true, 0, 0, 0, n_true)
+    if n_true == 0:
+        return (0, n_pred, 0, n_pred, 0)
+
+    pred_slices = find_objects(pred_lab)
+    true_slices = find_objects(true_lab)
+
+    tp = 0
+    matched = set()
+    for i, ps in enumerate(pred_slices):
+        best_iou, best_j = 0.0, -1
+        pm = (pred_lab == (i + 1))
+        for j, ts in enumerate(true_slices):
+            if j in matched:
+                continue
+            if ps[0].start >= ts[0].stop or ps[0].stop <= ts[0].start:
+                continue
+            tm = (true_lab == (j + 1))
+            inter = np.logical_and(pm, tm).sum()
+            union = np.logical_or(pm, tm).sum()
+            iou = inter / (union + 1e-8)
+            if iou > best_iou:
+                best_iou, best_j = iou, j
+        if best_iou >= min_iou:
+            tp += 1
+            matched.add(best_j)
+
+    fp = n_pred - tp
+    fn = n_true - len(matched)
+    return (n_true, n_pred, tp, fp, fn)
+
+
+def compute_onset_metrics(pred_mask: np.ndarray, true_mask: np.ndarray,
+                          fs: int = 250, tolerance_ms: float = 100.0) -> dict:
+    """
+    Matches events if their onsets are within `tolerance_ms`.
+    Returns Precision/Recall and average time error.
+    """
+    from scipy.ndimage import label, find_objects
+
+    # Get event slices
+    pred_lab, n_pred = label(pred_mask)
+    true_lab, n_true = label(true_mask)
+
+    if n_pred == 0 and n_true == 0:
+        return {
+            'onset_precision': 1.0, 'onset_recall': 1.0,
+            'mean_error_ms': 0.0, 'std_error_ms': 0.0, 'bias_ms': 0.0,
+        }
+    if n_pred == 0:
+        return {
+            'onset_precision': 1.0, 'onset_recall': 0.0,
+            'mean_error_ms': 0.0, 'std_error_ms': 0.0, 'bias_ms': 0.0,
+        }
+    if n_true == 0:
+        return {
+            'onset_precision': 0.0, 'onset_recall': 0.0,
+            'mean_error_ms': 0.0, 'std_error_ms': 0.0, 'bias_ms': 0.0,
+        }
+
+    pred_slices = find_objects(pred_lab)
+    true_slices = find_objects(true_lab)
+
+    # Extract start samples (onsets)
+    pred_onsets = np.array([s[0].start for s in pred_slices])
+    true_onsets = np.array([s[0].start for s in true_slices])
+
+    # Convert tolerance to samples
+    tol_samples = int(tolerance_ms / 1000 * fs)
+
+    tp = 0
+    errors = []
+    matched_true = set()
+
+    # Match Predictions to Ground Truth
+    for p_start in pred_onsets:
+        # Find closest ground truth onset
+        if len(true_onsets) == 0:
+            break
+
+        dist = np.abs(true_onsets - p_start)
+        min_idx = np.argmin(dist)
+        min_dist = dist[min_idx]
+
+        if min_dist <= tol_samples and min_idx not in matched_true:
+            tp += 1
+            matched_true.add(min_idx)
+            # Record the raw error (Predicted - True)
+            # Negative = Predicted early (Model anticipated artifact)
+            # Positive = Predicted late (Model lagged)
+            errors.append(p_start - true_onsets[min_idx])
+
+    # Convert errors to ms
+    errors_ms = np.array(errors) / fs * 1000.0
+
+    fp = n_pred - tp
+    fn = n_true - tp
+
+    return {
+        'onset_precision': tp / (tp + fp + 1e-8),
+        'onset_recall': tp / (tp + fn + 1e-8),
+        'mean_error_ms': float(np.mean(errors_ms)) if errors_ms.size > 0 else 0.0,
+        'std_error_ms': float(np.std(errors_ms)) if errors_ms.size > 0 else 0.0,
+        'bias_ms': float(np.median(errors_ms)) if errors_ms.size > 0 else 0.0,
+    }
+
+
 # =============================================================================
 # 12. Trainer
 # =============================================================================
@@ -876,10 +1002,28 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=5,
-            min_lr=cfg.min_lr
-        )
+
+        if cfg.lr_scheduler == "onecycle":
+            # OneCycleLR is created in fit() (needs steps_per_epoch from train_loader)
+            self.scheduler = None
+            self._step_scheduler_per_batch = True
+        else:
+            # warmup_cosine: 5-epoch warmup, then cosine decay to eta_min
+            warmup = LinearLR(
+                self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=5
+            )
+            cosine = CosineAnnealingLR(
+                self.optimizer, T_max=cfg.epochs - 5, eta_min=cfg.min_lr
+            )
+            self.scheduler = SequentialLR(
+                self.optimizer, schedulers=[warmup, cosine], milestones=[5]
+            )
+            self._step_scheduler_per_batch = False
+        # Previous alternative (epoch-based):
+        # warmup = LinearLR(..., total_iters=5)
+        # cosine = CosineAnnealingLR(..., T_max=145, eta_min=1e-6)
+        # self.scheduler = SequentialLR(..., milestones=[5])
+
         self.criterion = CombinedLoss(cfg)
         self.best_f1 = 0.0
 
@@ -907,6 +1051,8 @@ class Trainer:
             losses['loss'].backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
+            if self._step_scheduler_per_batch and self.scheduler is not None:
+                self.scheduler.step()
 
             total_loss += losses['loss'].detach()
             all_pred.append(pred.detach().cpu())
@@ -954,6 +1100,8 @@ class Trainer:
         # Stitch predictions per file
         sample_metrics_list = []
         event_metrics_list = []
+        onset_metrics_list = []
+        fs = self.cfg.sampling_rate
 
         for fid, wins in file_wins.items():
             rlen = file_lens[fid]
@@ -970,17 +1118,21 @@ class Trainer:
             pred_avg = np.divide(pred_acc, wgt, out=np.zeros_like(pred_acc),
                                  where=wgt > 0)
 
-            # Sample-level metrics (raw)
+            # Sample-level metrics (raw mask overlap: P, R, F1, IoU)
             sm = compute_sample_metrics(
                 torch.from_numpy(pred_avg).unsqueeze(0),
                 torch.from_numpy(mask_acc).unsqueeze(0),
             )
             sample_metrics_list.append(sm)
 
-            # Event-level metrics (post-processed)
+            # Event-level metrics (IoU-based, post-processed)
             pred_bin = post_process_mask((pred_avg > 0.5).astype(int), self.cfg)
             em = compute_event_metrics(pred_bin, mask_acc.astype(int))
             event_metrics_list.append(em)
+
+            # Onset-level metrics (onset match within tolerance_ms + time error)
+            om = compute_onset_metrics(pred_bin, mask_acc.astype(int), fs=fs)
+            onset_metrics_list.append(om)
 
         # Aggregate
         agg = {}
@@ -988,6 +1140,8 @@ class Trainer:
             agg[key] = np.mean([m[key] for m in sample_metrics_list])
         for key in event_metrics_list[0]:
             agg[key] = np.mean([m[key] for m in event_metrics_list])
+        for key in onset_metrics_list[0]:
+            agg[key] = np.mean([m[key] for m in onset_metrics_list])
         agg['loss'] = total_loss / max(len(loader), 1)
         return agg
 
@@ -1032,6 +1186,20 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {n_params:,}")
         print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+        print(f"LR scheduler: {self.cfg.lr_scheduler}")
+
+        # OneCycleLR needs steps_per_epoch; create it at fit start
+        if self.cfg.lr_scheduler == "onecycle":
+            self.scheduler = OneCycleLR(
+                self.optimizer,
+                max_lr=self.cfg.lr,
+                epochs=self.cfg.epochs,
+                steps_per_epoch=len(train_loader),
+                pct_start=0.3,
+                anneal_strategy="cos",
+                div_factor=25.0,
+                final_div_factor=1e4,
+            )
 
         patience_ctr = 0
 
@@ -1044,15 +1212,18 @@ class Trainer:
             train_m = self.train_epoch(train_loader)
             val_m = self.validate(val_loader)
 
-            self.scheduler.step(val_m['f1'])
+            if not self._step_scheduler_per_batch:
+                self.scheduler.step()
 
             print(f"  Train │ loss={train_m['loss']:.4f}  F1={train_m['f1']:.4f}"
-                  f"  P={train_m['precision']:.4f}  R={train_m['recall']:.4f}")
+                  f"  P={train_m['precision']:.4f}  R={train_m['recall']:.4f}  IoU={train_m['iou']:.4f}")
             print(f"  Val   │ loss={val_m['loss']:.4f}  F1={val_m['f1']:.4f}"
-                  f"  P={val_m['precision']:.4f}  R={val_m['recall']:.4f}")
+                  f"  P={val_m['precision']:.4f}  R={val_m['recall']:.4f}  IoU={val_m['iou']:.4f}")
             print(f"  Event │ F1={val_m['event_f1']:.4f}"
                   f"  P={val_m['event_precision']:.4f}"
                   f"  R={val_m['event_recall']:.4f}")
+            print(f"  Onset │ P={val_m['onset_precision']:.4f}  R={val_m['onset_recall']:.4f}"
+                  f"  mean_err={val_m['mean_error_ms']:.2f}ms  std_err={val_m['std_error_ms']:.2f}ms  bias={val_m['bias_ms']:.2f}ms")
 
             if val_m['f1'] > self.best_f1:
                 self.best_f1 = val_m['f1']
